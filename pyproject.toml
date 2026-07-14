@@ -1,0 +1,20 @@
+[project]
+name = "outlook-mcp"
+version = "0.1.0"
+description = "MCP server for Microsoft Outlook desktop via COM automation (win32com) - no Graph API required"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+    "pywin32>=306; sys_platform == 'win32'",
+]
+
+[project.scripts]
+outlook-mcp = "outlook_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/outlook_mcp"]
