@@ -63,6 +63,10 @@ If Outlook is not running, the first tool call starts it automatically.
 | `delete_email` | Move an email to Deleted Items |
 | `list_calendar_events` | Events in a window around today (recurrences expanded) |
 | `create_calendar_event` | Create an appointment or send a meeting invite |
+| `check_availability` | Show attendees' free/busy timeline for a day |
+| `find_meeting_times` | Find slots when **all** attendees are free |
+| `schedule_out_of_office` | Block your calendar with Out-of-Office status |
+| `set_automatic_replies` | Guidance only — auto-replies aren't COM-settable (see below) |
 | `list_contacts` | List/search the default Contacts folder |
 
 Emails are addressed by their Outlook `EntryID`, which `list_emails` and
@@ -78,7 +82,31 @@ specific account.
 - "Reply to that email saying I'll review it by Friday"
 - "Save the attachments from that email to C:\\Users\\me\\Downloads"
 - "What's on my calendar this week?"
+- "Check if alice@corp.com and bob@corp.com are free Thursday afternoon"
+- "Find a 30-minute slot next Monday when the whole team is available"
 - "Set up a 30-minute meeting with bob@example.com tomorrow at 2pm"
+- "Mark me out of office next Friday through the following Wednesday"
+
+## Checking other people's availability
+
+`check_availability` and `find_meeting_times` read **free/busy** data — the
+same busy/free blocks Outlook shows in the Scheduling Assistant. In most
+Exchange/Microsoft 365 organizations every user can see everyone else's
+free/busy by default (busy times only, not the meeting subjects), so no
+special mailbox permissions are needed. If a person has restricted their
+free/busy sharing, their slots come back as unavailable and the tools say so.
+
+## Out of office: what works and what doesn't
+
+- **`schedule_out_of_office` works** — it creates a calendar block with
+  "Out of Office" availability status, so you show as away in other people's
+  free/busy and Scheduling Assistant.
+- **Automatic replies (the auto-responder email) cannot be set via COM.** The
+  Outlook Object Model simply does not expose Out-of-Office reply settings.
+  `set_automatic_replies` therefore only returns guidance. To turn on the
+  auto-responder, either flip it on manually (File > Automatic Replies) or use
+  Exchange Web Services (`SetUserOofSettings`) / Microsoft Graph
+  (`mailboxSettings.automaticRepliesSetting`) — both of which are outside COM.
 
 ## Notes & troubleshooting
 
