@@ -92,6 +92,42 @@ specific account.
 - "Set up a 30-minute meeting with bob@example.com tomorrow at 2pm"
 - "Mark me out of office next Friday through the following Wednesday"
 
+## Time zones (recommended for meetings)
+
+The meeting-creation tools (`create_calendar_event`, `create_teams_meeting`,
+`create_recurring_meeting`) accept an optional `timezone_name`. Give it an IANA
+name (`Asia/Kolkata`), a Windows ID (`India Standard Time`), or a common
+abbreviation (`IST`). The start time you pass is treated as wall-clock time in
+that zone, and the result reports both the local and UTC times.
+
+This matters most for **recurring** meetings: without an explicit zone, a
+series pinned to "12:00" can shift by an hour when it crosses a daylight-saving
+boundary, because Outlook interprets the time in whatever zone the profile
+happens to be in. Passing `timezone_name` sets the appointment's
+`StartTimeZone`/`EndTimeZone` in COM so occurrences stay put. (Note: on Windows,
+Python needs the `tzdata` package for this — it's declared as a dependency.)
+
+## Recipient validation
+
+`send_email` (and the meeting tools) add each recipient individually and call
+`ResolveAll()` before sending. If any name is ambiguous or unknown, the send is
+**rejected** with the offending entries listed — pass `allow_unresolved=True`
+to override. Results list every recipient's canonical SMTP address (Exchange
+`EX` addresses are resolved to real SMTP), so you can confirm exactly who will
+receive the message before trusting it.
+
+## Development & tests
+
+```powershell
+pip install -e ".[dev]"
+pytest
+```
+
+The pure-logic layer (date/timezone parsing, DST conversion, recurrence,
+recipient resolution) is covered by mock-based tests that run on any platform —
+no Windows or Outlook required. COM interaction itself can only be exercised on
+Windows. CI runs the suite on Python 3.10–3.12.
+
 ## Checking other people's availability
 
 `check_availability` and `find_meeting_times` read **free/busy** data — the

@@ -25,6 +25,8 @@ from typing import Any, Iterator
 
 from mcp.server.fastmcp import FastMCP
 
+from . import timezones as tz
+
 try:
     import pythoncom
     import win32com.client
@@ -266,6 +268,81 @@ def sender_address(item: Any) -> str:
         return getattr(item, "SenderEmailAddress", "") or ""
 
 
+def split_recipients(value: str) -> list[str]:
+    """Split a recipient string on semicolons/newlines into trimmed entries."""
+    parts: list[str] = []
+    for chunk in value.replace("\n", ";").split(";"):
+        chunk = chunk.strip()
+        if chunk:
+            parts.append(chunk)
+    return parts
+
+
+def recipient_smtp(recipient: Any) -> str:
+    """Canonical SMTP address of a resolved Recipient (resolves Exchange EX)."""
+    try:
+        entry = recipient.AddressEntry
+        if entry is not None and entry.Type == "EX":
+            exch = entry.GetExchangeUser()
+            if exch is not None and exch.PrimarySmtpAddress:
+                return exch.PrimarySmtpAddress
+        if entry is not None and entry.Address:
+            return entry.Address
+    except Exception:
+        pass
+    return getattr(recipient, "Address", "") or ""
+
+
+def add_and_resolve_recipients(
+    item: Any, buckets: list[tuple[str, str, int]], allow_unresolved: bool
+) -> list[dict[str, str]]:
+    """Add recipients to a mail item by type, resolve, and validate.
+
+    buckets is a list of (address_string, label, olMailRecipientType). Raises
+    ValueError listing any names that could not be resolved unless
+    allow_unresolved is True. Returns one dict per recipient with its resolved
+    name and canonical SMTP address.
+    """
+    added: list[tuple[str, str, Any]] = []
+    for addr_string, label, rtype in buckets:
+        for addr in split_recipients(addr_string):
+            recip = item.Recipients.Add(addr)
+            recip.Type = rtype
+            added.append((label, addr, recip))
+
+    item.Recipients.ResolveAll()
+
+    unresolved = [addr for _, addr, recip in added if not recip.Resolved]
+    if unresolved and not allow_unresolved:
+        raise ValueError(
+            "Could not resolve these recipients in the address book / GAL: "
+            + ", ".join(repr(a) for a in unresolved)
+            + ". Fix the addresses, or pass allow_unresolved=True to send anyway."
+        )
+
+    resolved: list[dict[str, str]] = []
+    for label, addr, recip in added:
+        resolved.append(
+            {
+                "type": label,
+                "input": addr,
+                "name": getattr(recip, "Name", addr) or addr,
+                "smtp": recipient_smtp(recip) if recip.Resolved else "",
+                "resolved": "yes" if recip.Resolved else "NO",
+            }
+        )
+    return resolved
+
+
+def format_recipient_lines(resolved: list[dict[str, str]]) -> str:
+    lines = []
+    for r in resolved:
+        smtp = f" <{r['smtp']}>" if r["smtp"] else ""
+        unresolved = "" if r["resolved"] == "yes" else "  [UNRESOLVED]"
+        lines.append(f"  {r['type']}: {r['name']}{smtp}{unresolved}")
+    return "\n".join(lines)
+
+
 def fmt_dt(value: Any) -> str:
     try:
         return value.strftime("%Y-%m-%d %H:%M")
@@ -311,14 +388,41 @@ def dasl_escape(text: str) -> str:
 
 
 def parse_when(value: str) -> datetime:
-    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+    """Parse a naive local datetime (shared with the timezone module)."""
+    return tz.parse_naive(value)
+
+
+def apply_timezone(app: Any, appt: Any, start_dt: datetime, timezone_name: str) -> dict[str, str]:
+    """Set an appointment's Start/End time zone via COM and report the times.
+
+    Must be called before setting appt.Start (the COM object interprets Start as
+    a wall-clock time in StartTimeZone). Returns a dict describing local/UTC
+    times so callers can surface unambiguous, DST-correct results.
+    """
+    rtz = tz.resolve_timezone(timezone_name)
+    aware = tz.localize(start_dt, rtz)
+    utc = tz.to_utc(aware)
+    info = {
+        "timezone": rtz.label,
+        "start_local": tz.fmt(aware),
+        "start_utc": tz.fmt(utc),
+    }
+    if rtz.windows is not None:
         try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    raise ValueError(
-        f"Could not parse datetime {value!r}. Use 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD'."
-    )
+            com_tz = app.TimeZones.Item(rtz.windows)
+            appt.StartTimeZone = com_tz
+            appt.EndTimeZone = com_tz
+        except Exception as exc:  # pragma: no cover - COM-only path
+            info["timezone_warning"] = (
+                f"Could not apply Windows time zone {rtz.windows!r} in Outlook "
+                f"({exc}); the time was set in the profile's zone instead."
+            )
+    else:
+        info["timezone_warning"] = (
+            f"No Windows time-zone ID mapped for {rtz.iana!r}; Outlook stored the "
+            "time in the profile's zone. UTC value above is still correct."
+        )
+    return info
 
 
 def restrict_date(dt: datetime) -> str:
@@ -554,8 +658,15 @@ def send_email(
     html: bool = False,
     attachments: list[str] | None = None,
     save_as_draft: bool = False,
+    allow_unresolved: bool = False,
 ) -> str:
     """Send a new email (or save it as a draft) through Outlook.
+
+    Every recipient is added individually and resolved against the address book
+    before sending. If any name is ambiguous or unknown, the send is rejected
+    with the offending entries listed (unless allow_unresolved=True). The result
+    lists each recipient's canonical SMTP address so you can confirm before
+    trusting the send.
 
     Args:
         to: Recipient address(es), separated by semicolons.
@@ -566,15 +677,19 @@ def send_email(
         html: Treat body as HTML.
         attachments: Absolute paths of files to attach.
         save_as_draft: Save to Drafts instead of sending.
+        allow_unresolved: Send even if some recipients don't resolve (default
+            False, which is the safe behavior).
     """
+    if not split_recipients(to):
+        raise ValueError("At least one 'to' recipient is required.")
     with outlook_session() as ns:
         app = ns.Application
         mail = app.CreateItem(ITEM_MAIL)
-        mail.To = to
-        if cc:
-            mail.CC = cc
-        if bcc:
-            mail.BCC = bcc
+        resolved = add_and_resolve_recipients(
+            mail,
+            [(to, "To", 1), (cc, "CC", 2), (bcc, "BCC", 3)],
+            allow_unresolved,
+        )
         mail.Subject = subject
         if html:
             mail.HTMLBody = body
@@ -585,11 +700,16 @@ def send_email(
             if not file.is_file():
                 raise ValueError(f"Attachment not found: {path}")
             mail.Attachments.Add(str(file))
+
+        recipient_block = format_recipient_lines(resolved)
         if save_as_draft:
             mail.Save()
-            return f"Draft saved: {subject!r} to {to}"
+            return (
+                f"Draft saved: {subject!r}\nentry_id: {mail.EntryID}\n"
+                f"Recipients:\n{recipient_block}"
+            )
         mail.Send()
-        return f"Email sent: {subject!r} to {to}"
+        return f"Email sent: {subject!r}\nRecipients:\n{recipient_block}"
 
 
 @mcp.tool()
@@ -736,40 +856,64 @@ def create_calendar_event(
     location: str = "",
     body: str = "",
     attendees: str = "",
+    timezone_name: str = "",
 ) -> str:
     """Create a calendar event, optionally sending invites to attendees.
 
     Args:
         subject: Event title.
-        start: Start time as "YYYY-MM-DD HH:MM".
+        start: Start time as "YYYY-MM-DD HH:MM" (wall-clock in timezone_name).
         duration_minutes: Length of the event in minutes.
         location: Optional location.
         body: Optional description.
         attendees: Optional semicolon-separated attendee addresses; if given,
             the event is sent as a meeting invitation.
+        timezone_name: Time zone for `start`, as an IANA name
+            ("Asia/Kolkata"), Windows ID ("India Standard Time"), or common
+            abbreviation ("IST"). If omitted, the time is interpreted in
+            Outlook's own profile time zone (may be ambiguous across DST).
     """
     start_dt = parse_when(start)
     with outlook_session() as ns:
         app = ns.Application
         appt = app.CreateItem(ITEM_APPOINTMENT)
         appt.Subject = subject
+        tzinfo: dict[str, str] = {}
+        if timezone_name:
+            tzinfo = apply_timezone(app, appt, start_dt, timezone_name)
         appt.Start = start_dt
         appt.Duration = duration_minutes
         if location:
             appt.Location = location
         if body:
             appt.Body = body
+        tz_note = _tz_note(tzinfo)
         if attendees:
-            appt.MeetingStatus = 1  # olMeeting
-            for addr in attendees.split(";"):
-                addr = addr.strip()
-                if addr:
-                    appt.Recipients.Add(addr)
-            appt.Recipients.ResolveAll()
+            appt.MeetingStatus = MEETING_MEETING
+            resolved = add_and_resolve_recipients(
+                appt, [(attendees, "Required", 1)], allow_unresolved=False
+            )
             appt.Send()
-            return f"Meeting invite sent: {subject!r} at {start} to {attendees}"
+            return (
+                f"Meeting invite sent: {subject!r} at {start}{tz_note}\n"
+                f"Attendees:\n{format_recipient_lines(resolved)}"
+            )
         appt.Save()
-        return f"Event created: {subject!r} at {start} ({duration_minutes} min)"
+        return f"Event created: {subject!r} at {start} ({duration_minutes} min){tz_note}"
+
+
+def _tz_note(tzinfo: dict[str, str]) -> str:
+    """Render an apply_timezone() result dict as a short human-readable suffix."""
+    if not tzinfo:
+        return ""
+    note = (
+        f"\nTime zone: {tzinfo['timezone']}"
+        f"\nLocal:  {tzinfo['start_local']}"
+        f"\nUTC:    {tzinfo['start_utc']}"
+    )
+    if "timezone_warning" in tzinfo:
+        note += f"\nWarning: {tzinfo['timezone_warning']}"
+    return note
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1169,7 @@ def create_teams_meeting(
     attendees: str = "",
     location: str = "",
     body: str = "",
+    timezone_name: str = "",
     save_as_draft: bool = False,
 ) -> str:
     """Create and send a meeting invite, intended as a Microsoft Teams meeting.
@@ -1040,11 +1185,13 @@ def create_teams_meeting(
 
     Args:
         subject: Meeting title.
-        start: Start time, "YYYY-MM-DD HH:MM".
+        start: Start time, "YYYY-MM-DD HH:MM" (wall-clock in timezone_name).
         duration_minutes: Length in minutes.
         attendees: Semicolon-separated attendee addresses (required to invite).
         location: Optional location (ignored for online-only meetings).
         body: Optional agenda/description.
+        timezone_name: Time zone for `start` (IANA / Windows ID / abbreviation);
+            omit to use Outlook's profile zone.
         save_as_draft: Save to Drafts instead of sending.
     """
     start_dt = parse_when(start)
@@ -1052,6 +1199,9 @@ def create_teams_meeting(
         app = ns.Application
         appt = app.CreateItem(ITEM_APPOINTMENT)
         appt.Subject = subject
+        tzinfo: dict[str, str] = {}
+        if timezone_name:
+            tzinfo = apply_timezone(app, appt, start_dt, timezone_name)
         appt.Start = start_dt
         appt.Duration = duration_minutes
         if location:
@@ -1059,14 +1209,11 @@ def create_teams_meeting(
         if body:
             appt.Body = body
         appt.MeetingStatus = MEETING_MEETING
-        added = []
-        for addr in attendees.split(";"):
-            addr = addr.strip()
-            if addr:
-                appt.Recipients.Add(addr)
-                added.append(addr)
-        if added:
-            appt.Recipients.ResolveAll()
+        resolved: list[dict[str, str]] = []
+        if split_recipients(attendees):
+            resolved = add_and_resolve_recipients(
+                appt, [(attendees, "Required", 1)], allow_unresolved=False
+            )
 
         # Best-effort probe for whether it became an online/Teams meeting.
         is_online = False
@@ -1092,8 +1239,13 @@ def create_teams_meeting(
                 "Teams link manually — COM cannot inject it."
             )
         )
-        who = f" to {', '.join(added)}" if added else ""
-        return f"{action}: {subject!r} at {start} ({duration_minutes} min){who}.{note}"
+        who = (
+            f"\nAttendees:\n{format_recipient_lines(resolved)}" if resolved else ""
+        )
+        return (
+            f"{action}: {subject!r} at {start} ({duration_minutes} min)"
+            f"{_tz_note(tzinfo)}{who}{note}"
+        )
 
 
 @mcp.tool()
@@ -1109,6 +1261,7 @@ def create_recurring_meeting(
     attendees: str = "",
     location: str = "",
     body: str = "",
+    timezone_name: str = "",
     save_as_draft: bool = False,
 ) -> str:
     """Create and send a recurring meeting invitation.
@@ -1118,9 +1271,13 @@ def create_recurring_meeting(
     cannot inject it. Recipients receive the whole series; when they accept, they
     accept the series.
 
+    Setting timezone_name is strongly recommended for recurring series: it pins
+    the wall-clock time to a real zone so occurrences stay correct across a
+    daylight-saving transition instead of drifting by an hour.
+
     Args:
         subject: Meeting title.
-        start: First occurrence start, "YYYY-MM-DD HH:MM".
+        start: First occurrence start, "YYYY-MM-DD HH:MM" (in timezone_name).
         recurrence: "daily", "weekly", "monthly", or "yearly".
         duration_minutes: Length of each occurrence.
         interval: Repeat every N units (e.g. interval=2 + weekly = fortnightly).
@@ -1132,6 +1289,9 @@ def create_recurring_meeting(
         attendees: Semicolon-separated attendee addresses.
         location: Optional location.
         body: Optional agenda/description.
+        timezone_name: Time zone for the series (IANA / Windows ID /
+            abbreviation). Omit to use Outlook's profile zone (not recommended
+            for recurring meetings that cross a DST boundary).
         save_as_draft: Save to Drafts instead of sending.
     """
     start_dt = parse_when(start)
@@ -1139,6 +1299,9 @@ def create_recurring_meeting(
         app = ns.Application
         appt = app.CreateItem(ITEM_APPOINTMENT)
         appt.Subject = subject
+        tzinfo: dict[str, str] = {}
+        if timezone_name:
+            tzinfo = apply_timezone(app, appt, start_dt, timezone_name)
         appt.Start = start_dt
         appt.Duration = duration_minutes
         if location:
@@ -1146,14 +1309,11 @@ def create_recurring_meeting(
         if body:
             appt.Body = body
         appt.MeetingStatus = MEETING_MEETING
-        added = []
-        for addr in attendees.split(";"):
-            addr = addr.strip()
-            if addr:
-                appt.Recipients.Add(addr)
-                added.append(addr)
-        if added:
-            appt.Recipients.ResolveAll()
+        resolved: list[dict[str, str]] = []
+        if split_recipients(attendees):
+            resolved = add_and_resolve_recipients(
+                appt, [(attendees, "Required", 1)], allow_unresolved=False
+            )
 
         # Configure recurrence last — setting Start after this resets it.
         summary = apply_recurrence(
@@ -1166,8 +1326,13 @@ def create_recurring_meeting(
         else:
             appt.Send()
             action = "Recurring meeting invite sent"
-        who = f" to {', '.join(added)}" if added else ""
-        return f"{action}: {subject!r} ({summary}), first at {start}{who}."
+        who = (
+            f"\nAttendees:\n{format_recipient_lines(resolved)}" if resolved else ""
+        )
+        return (
+            f"{action}: {subject!r} ({summary}), first at {start}"
+            f"{_tz_note(tzinfo)}{who}"
+        )
 
 
 @mcp.tool()

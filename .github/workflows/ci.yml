@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (without Windows-only deps)
+        run: |
+          python -m pip install --upgrade pip
+          # pywin32/tzdata are win32-only markers; mcp + pytest install everywhere.
+          pip install -e ".[dev]"
+      - name: Byte-compile
+        run: python -m compileall src
+      - name: Run tests
+        run: pytest -q
