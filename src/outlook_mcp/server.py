@@ -56,6 +56,22 @@ BUSY_BUSY = 2
 BUSY_OUT_OF_OFFICE = 3
 BUSY_WORKING_ELSEWHERE = 4
 
+# OlMeetingStatus / OlMeetingResponse
+MEETING_MEETING = 1  # olMeeting
+MEETING_REQUEST_CLASS = 53  # olMeetingRequest (a MeetingItem)
+RESPONSE_TENTATIVE = 2  # olMeetingTentative
+RESPONSE_ACCEPTED = 3  # olMeetingAccepted
+RESPONSE_DECLINED = 4  # olMeetingDeclined
+
+RESPONSE_MAP = {
+    "accept": RESPONSE_ACCEPTED,
+    "accepted": RESPONSE_ACCEPTED,
+    "tentative": RESPONSE_TENTATIVE,
+    "maybe": RESPONSE_TENTATIVE,
+    "decline": RESPONSE_DECLINED,
+    "declined": RESPONSE_DECLINED,
+}
+
 # Recipient.FreeBusy() with CompleteFormat=True returns one char per time slot.
 FREEBUSY_LEGEND = {
     "0": "Free",
@@ -910,6 +926,223 @@ def set_automatic_replies(
             else ""
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Meetings & invitations
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def create_teams_meeting(
+    subject: str,
+    start: str,
+    duration_minutes: int = 30,
+    attendees: str = "",
+    location: str = "",
+    body: str = "",
+    save_as_draft: bool = False,
+) -> str:
+    """Create and send a meeting invite, intended as a Microsoft Teams meeting.
+
+    IMPORTANT — how the Teams link is added: COM cannot inject a Teams join
+    link directly (the link comes from the Teams Meeting Add-in / service, not
+    the Outlook Object Model). This tool relies on the mailbox/Outlook setting
+    "Add online meeting to all meetings" (Outlook > File > Options > Calendar).
+    When that setting is ON, meetings created and sent here automatically become
+    Teams meetings with a join link. When it is OFF, this sends an ordinary
+    (non-online) meeting invite — the return message will remind you to enable
+    the setting or add the Teams link manually.
+
+    Args:
+        subject: Meeting title.
+        start: Start time, "YYYY-MM-DD HH:MM".
+        duration_minutes: Length in minutes.
+        attendees: Semicolon-separated attendee addresses (required to invite).
+        location: Optional location (ignored for online-only meetings).
+        body: Optional agenda/description.
+        save_as_draft: Save to Drafts instead of sending.
+    """
+    start_dt = parse_when(start)
+    with outlook_session() as ns:
+        app = ns.Application
+        appt = app.CreateItem(ITEM_APPOINTMENT)
+        appt.Subject = subject
+        appt.Start = start_dt
+        appt.Duration = duration_minutes
+        if location:
+            appt.Location = location
+        if body:
+            appt.Body = body
+        appt.MeetingStatus = MEETING_MEETING
+        added = []
+        for addr in attendees.split(";"):
+            addr = addr.strip()
+            if addr:
+                appt.Recipients.Add(addr)
+                added.append(addr)
+        if added:
+            appt.Recipients.ResolveAll()
+
+        # Best-effort probe for whether it became an online/Teams meeting.
+        is_online = False
+        try:
+            is_online = bool(appt.IsOnlineMeeting)  # not present on all builds
+        except Exception:
+            is_online = False
+
+        if save_as_draft:
+            appt.Save()
+            action = "Meeting draft saved"
+        else:
+            appt.Send()
+            action = "Meeting invite sent"
+
+        note = (
+            ""
+            if is_online
+            else (
+                "\nNote: could not confirm a Teams link was attached. If this "
+                "meeting isn't a Teams meeting, enable Outlook > File > Options "
+                "> Calendar > 'Add online meeting to all meetings', or add the "
+                "Teams link manually — COM cannot inject it."
+            )
+        )
+        who = f" to {', '.join(added)}" if added else ""
+        return f"{action}: {subject!r} at {start} ({duration_minutes} min){who}.{note}"
+
+
+@mcp.tool()
+def list_meeting_invitations(count: int = 20) -> str:
+    """List pending meeting invitations sitting in your Inbox.
+
+    Returns the meeting requests you have not yet responded to, with the
+    organizer and proposed time. Use the entry_id with respond_to_invitation.
+
+    Args:
+        count: Maximum invitations to return (1-100).
+    """
+    count = max(1, min(count, 100))
+    with outlook_session() as ns:
+        items = resolve_folder(ns, "Inbox").Items
+        items.Sort("[ReceivedTime]", True)
+        results = []
+        for item in items:
+            if getattr(item, "Class", None) != MEETING_REQUEST_CLASS:
+                continue
+            try:
+                appt = item.GetAssociatedAppointment(False)
+                when = f"{fmt_dt(appt.Start)} -> {fmt_dt(appt.End)}"
+                location = appt.Location or ""
+            except Exception:
+                when = "(unknown time)"
+                location = ""
+            loc = f"  |  {location}" if location else ""
+            results.append(
+                f"{len(results) + 1}. {item.Subject}\n"
+                f"   Organizer: {item.SenderName}\n"
+                f"   When: {when}{loc}\n"
+                f"   entry_id: {item.EntryID}"
+            )
+            if len(results) >= count:
+                break
+        return "\n\n".join(results) if results else "No pending meeting invitations."
+
+
+@mcp.tool()
+def respond_to_invitation(
+    entry_id: str,
+    response: str,
+    message: str = "",
+    send_response: bool = True,
+) -> str:
+    """Accept, tentatively accept, or decline a meeting invitation.
+
+    NOTE: "Propose new time" is NOT available through COM — the Outlook Object
+    Model has no propose-new-time method. To suggest a different time, decline
+    with a message here (or reply by email) and let the organizer reschedule.
+
+    Args:
+        entry_id: EntryID of the meeting invitation (from list_meeting_invitations)
+            or of an appointment already on your calendar.
+        response: One of "accept", "tentative", or "decline".
+        message: Optional note included with your response to the organizer.
+        send_response: If True, send the response to the organizer; if False,
+            respond without notifying them (Outlook's "Do Not Send Response").
+    """
+    key = response.strip().lower()
+    if key not in RESPONSE_MAP:
+        raise ValueError('response must be one of: "accept", "tentative", "decline".')
+    code = RESPONSE_MAP[key]
+    with outlook_session() as ns:
+        obj = get_item(ns, entry_id)
+        if hasattr(obj, "GetAssociatedAppointment"):
+            appt = obj.GetAssociatedAppointment(True)
+        else:
+            appt = obj  # already an AppointmentItem
+        subject = appt.Subject
+        resp = appt.Respond(code, True, False)
+        verb = {
+            RESPONSE_ACCEPTED: "Accepted",
+            RESPONSE_TENTATIVE: "Tentatively accepted",
+            RESPONSE_DECLINED: "Declined",
+        }[code]
+        if resp is None:
+            return f"{verb} {subject!r} (no response object returned)."
+        if send_response:
+            if message:
+                resp.Body = message + "\n\n" + (resp.Body or "")
+            resp.Send()
+            return f"{verb} {subject!r} and sent a response to the organizer."
+        return f"{verb} {subject!r} without sending a response."
+
+
+@mcp.tool()
+def list_shared_calendar(person: str, days_ahead: int = 7, days_back: int = 0) -> str:
+    """Read the actual meetings on another person's calendar (if shared to you).
+
+    Unlike check_availability (which shows only free/busy blocks), this shows
+    real meeting subjects and times — but only works if that person has shared
+    their calendar with you at Reviewer permission or above. Without permission,
+    Outlook denies access and this returns an error; use check_availability for
+    plain free/busy instead.
+
+    Args:
+        person: Name or email of the calendar owner.
+        days_ahead: Days into the future to include.
+        days_back: Days into the past to include.
+    """
+    start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
+        days=days_back
+    )
+    end = start + timedelta(days=days_back + days_ahead + 1)
+    with outlook_session() as ns:
+        recip = resolve_recipient(ns, person)
+        try:
+            folder = ns.GetSharedDefaultFolder(recip, FOLDER_CALENDAR)
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot open {recip.Name}'s calendar — they likely have not "
+                f"shared it with you (Reviewer permission needed). {exc}"
+            ) from exc
+        items = folder.Items
+        items.Sort("[Start]")
+        items.IncludeRecurrences = True
+        items = items.Restrict(
+            f"[Start] >= '{restrict_date(start)}' AND [Start] < '{restrict_date(end)}'"
+        )
+        lines = []
+        for appt in items:
+            if len(lines) >= 100:
+                lines.append("[... truncated at 100 events ...]")
+                break
+            location = f" @ {appt.Location}" if appt.Location else ""
+            lines.append(
+                f"- {appt.Subject}{location}\n"
+                f"  {fmt_dt(appt.Start)} -> {fmt_dt(appt.End)}"
+            )
+        header = f"{recip.Name}'s calendar:"
+        return f"{header}\n" + ("\n".join(lines) if lines else "  No events in this window.")
 
 
 # ---------------------------------------------------------------------------
