@@ -68,6 +68,7 @@ If Outlook is not running, the first tool call starts it automatically.
 | `schedule_out_of_office` | Block your calendar with Out-of-Office status |
 | `set_automatic_replies` | Guidance only — auto-replies aren't COM-settable (see below) |
 | `create_teams_meeting` | Send a meeting invite (Teams link via org setting, see below) |
+| `create_recurring_meeting` | Send a recurring meeting invite (daily/weekly/monthly/yearly) |
 | `list_meeting_invitations` | List pending meeting requests in your Inbox |
 | `respond_to_invitation` | Accept / tentative / decline an invitation |
 | `list_shared_calendar` | Read another person's calendar (if shared to you) |
@@ -119,6 +120,12 @@ free/busy sharing, their slots come back as unavailable and the tools say so.
 - **"Propose new time" is not available via COM.** The Object Model has no
   propose-new-time method. To suggest another slot, decline with a message (or
   use `find_meeting_times` to pick a slot and send a fresh invite).
+- **Recurring meetings are supported.** `create_recurring_meeting` sends a full
+  series — daily, weekly (with specific weekdays like `Mon,Wed,Fri`), monthly,
+  or yearly, with an `interval` (e.g. every 2 weeks) and an end defined by a
+  number of occurrences (`count`) or an end date (`until`). Attendees receive
+  the series and accept it as a series. Recurring invites you *receive* are
+  accepted/declined as a whole series by `respond_to_invitation`.
 
 ## Out of office: what works and what doesn't
 

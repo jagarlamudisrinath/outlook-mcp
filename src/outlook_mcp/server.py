@@ -72,6 +72,90 @@ RESPONSE_MAP = {
     "declined": RESPONSE_DECLINED,
 }
 
+# OlRecurrenceType
+RECUR_DAILY = 0
+RECUR_WEEKLY = 1
+RECUR_MONTHLY = 2
+RECUR_YEARLY = 5
+
+RECUR_TYPE_MAP = {
+    "daily": RECUR_DAILY,
+    "weekly": RECUR_WEEKLY,
+    "monthly": RECUR_MONTHLY,
+    "yearly": RECUR_YEARLY,
+}
+
+# OlDaysOfWeek bit flags
+DAY_MASK = {
+    "sun": 1, "sunday": 1,
+    "mon": 2, "monday": 2,
+    "tue": 4, "tues": 4, "tuesday": 4,
+    "wed": 8, "wednesday": 8,
+    "thu": 16, "thur": 16, "thurs": 16, "thursday": 16,
+    "fri": 32, "friday": 32,
+    "sat": 64, "saturday": 64,
+}
+
+
+def parse_day_mask(days: str) -> int:
+    """Turn a string like 'Mon,Wed,Fri' into an OlDaysOfWeek bitmask."""
+    mask = 0
+    for token in days.replace(";", ",").split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if token not in DAY_MASK:
+            raise ValueError(f"Unknown weekday {token!r}. Use Mon..Sun.")
+        mask |= DAY_MASK[token]
+    return mask
+
+
+def apply_recurrence(
+    appt: Any,
+    recurrence: str,
+    interval: int,
+    days: str,
+    count: int,
+    until: str,
+    start_dt: datetime,
+    duration_minutes: int,
+) -> str:
+    """Configure an appointment's RecurrencePattern. Returns a human summary.
+
+    The appointment's Start/Duration must already be set; do not set Start after
+    calling this (that resets the pattern in the Outlook Object Model).
+    """
+    rtype = recurrence.strip().lower()
+    if rtype not in RECUR_TYPE_MAP:
+        raise ValueError('recurrence must be "daily", "weekly", "monthly", or "yearly".')
+    interval = max(1, interval)
+
+    rp = appt.GetRecurrencePattern()
+    rp.RecurrenceType = RECUR_TYPE_MAP[rtype]
+    rp.Interval = interval
+
+    detail = f"every {interval} {rtype.rstrip('ly')}(s)" if interval > 1 else rtype
+    if rtype == "weekly":
+        mask = parse_day_mask(days) if days else 0
+        if mask:
+            rp.DayOfWeekMask = mask
+            detail += f" on {days}"
+    elif rtype == "monthly":
+        rp.DayOfMonth = start_dt.day
+        detail += f" on day {start_dt.day}"
+
+    rp.PatternStartDate = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    if count and count > 0:
+        rp.Occurrences = count
+        detail += f", {count} occurrences"
+    elif until:
+        end_dt = parse_date_only(until)
+        rp.PatternEndDate = end_dt
+        detail += f", until {until}"
+    else:
+        detail += ", no end date"
+    return detail
+
 # Recipient.FreeBusy() with CompleteFormat=True returns one char per time slot.
 FREEBUSY_LEGEND = {
     "0": "Free",
@@ -1010,6 +1094,80 @@ def create_teams_meeting(
         )
         who = f" to {', '.join(added)}" if added else ""
         return f"{action}: {subject!r} at {start} ({duration_minutes} min){who}.{note}"
+
+
+@mcp.tool()
+def create_recurring_meeting(
+    subject: str,
+    start: str,
+    recurrence: str,
+    duration_minutes: int = 30,
+    interval: int = 1,
+    days: str = "",
+    count: int = 0,
+    until: str = "",
+    attendees: str = "",
+    location: str = "",
+    body: str = "",
+    save_as_draft: bool = False,
+) -> str:
+    """Create and send a recurring meeting invitation.
+
+    Same Teams-link caveat as create_teams_meeting: a Teams join link is only
+    added if your mailbox has "Add online meeting to all meetings" enabled — COM
+    cannot inject it. Recipients receive the whole series; when they accept, they
+    accept the series.
+
+    Args:
+        subject: Meeting title.
+        start: First occurrence start, "YYYY-MM-DD HH:MM".
+        recurrence: "daily", "weekly", "monthly", or "yearly".
+        duration_minutes: Length of each occurrence.
+        interval: Repeat every N units (e.g. interval=2 + weekly = fortnightly).
+        days: For weekly recurrence, which weekdays, e.g. "Mon,Wed,Fri".
+            Defaults to the weekday of `start` if omitted.
+        count: End the series after this many occurrences (0 = use `until` or
+            no end date).
+        until: End the series on this date, "YYYY-MM-DD" (ignored if count > 0).
+        attendees: Semicolon-separated attendee addresses.
+        location: Optional location.
+        body: Optional agenda/description.
+        save_as_draft: Save to Drafts instead of sending.
+    """
+    start_dt = parse_when(start)
+    with outlook_session() as ns:
+        app = ns.Application
+        appt = app.CreateItem(ITEM_APPOINTMENT)
+        appt.Subject = subject
+        appt.Start = start_dt
+        appt.Duration = duration_minutes
+        if location:
+            appt.Location = location
+        if body:
+            appt.Body = body
+        appt.MeetingStatus = MEETING_MEETING
+        added = []
+        for addr in attendees.split(";"):
+            addr = addr.strip()
+            if addr:
+                appt.Recipients.Add(addr)
+                added.append(addr)
+        if added:
+            appt.Recipients.ResolveAll()
+
+        # Configure recurrence last — setting Start after this resets it.
+        summary = apply_recurrence(
+            appt, recurrence, interval, days, count, until, start_dt, duration_minutes
+        )
+
+        if save_as_draft:
+            appt.Save()
+            action = "Recurring meeting draft saved"
+        else:
+            appt.Send()
+            action = "Recurring meeting invite sent"
+        who = f" to {', '.join(added)}" if added else ""
+        return f"{action}: {subject!r} ({summary}), first at {start}{who}."
 
 
 @mcp.tool()
