@@ -48,37 +48,69 @@ If Outlook is not running, the first tool call starts it automatically.
 
 ## Tools
 
+**Mail — read & search**
+
 | Tool | Description |
 |------|-------------|
 | `list_folders` | Tree of all mail folders across every account/store |
 | `list_emails` | Recent emails in a folder (newest first, optional unread-only) |
-| `get_email` | Full email by `entry_id`, including attachment list |
-| `search_emails` | Search a folder by subject / sender / body text |
-| `save_attachments` | Save an email's attachments to a local directory |
-| `send_email` | Send (or draft) a new email — plain text or HTML, with attachments |
-| `reply_to_email` | Reply / reply-all, with the original quoted below |
-| `forward_email` | Forward an email, attachments included |
+| `get_email` | Full email by `entry_id` — SMTP addresses, headers, HTML, links, Message-ID |
+| `search_emails` | Filtered search: text, sender/recipient, date range, unread/flagged/importance/attachments, across all folders or subfolders |
+| `list_attachments` | List an email's attachments (index, size, inline vs. real, MIME) |
+| `save_attachments` | Save attachments safely (sanitized names, no collisions, size limit, SHA-256) |
+
+**Mail — write, drafts & management**
+
+| Tool | Description |
+|------|-------------|
+| `send_email` | Send/draft — HTML, attachments, importance/sensitivity/categories, send-as/on-behalf, scheduled delivery, read receipt |
+| `reply_to_email` | Reply / reply-all — HTML, attachments |
+| `forward_email` | Forward — CC/BCC, validated recipients, attachments |
+| `list_drafts` | List messages in the Drafts folder |
+| `update_draft` | Edit a saved draft (subject/body/recipients/attachments) |
+| `send_draft` | Send an existing draft (re-validates recipients) |
+| `delete_draft` | Delete a draft |
+| `remove_attachment` | Remove one attachment from a draft/item |
 | `mark_email` | Mark read / unread |
 | `move_email` | Move an email to another folder |
 | `delete_email` | Move an email to Deleted Items |
+
+**Calendar & scheduling**
+
+| Tool | Description |
+|------|-------------|
 | `list_calendar_events` | Events in a window around today (recurrences expanded) |
-| `create_calendar_event` | Create an appointment or send a meeting invite |
+| `get_calendar_event` | Full event details — attendees + responses, recurrence, join links, categories |
+| `search_calendar_events` | Filter events by subject/organizer/location/category/Teams/recurring/attachments |
+| `create_calendar_event` | Create an appointment or send a meeting invite (timezone-aware) |
+| `create_teams_meeting` | Send a meeting invite (Teams link via org setting, see below) |
+| `create_recurring_meeting` | Send a recurring series (daily/weekly/monthly/yearly, timezone-aware) |
+| `update_calendar_event` | Update a whole event/series; add/remove attendees, optionally re-invite |
+| `update_single_occurrence` | Edit one occurrence of a recurring series |
+| `cancel_calendar_event` | Cancel a meeting you organize (notifies attendees) |
+| `cancel_single_occurrence` | Cancel one occurrence of a series |
+| `delete_calendar_event` | Delete an event with no notice |
 | `check_availability` | Show attendees' free/busy timeline for a day |
-| `find_meeting_times` | Find slots when **all** attendees are free |
+| `find_meeting_times` | Find slots when **all** attendees are free, across a date range |
 | `schedule_out_of_office` | Block your calendar with Out-of-Office status |
 | `set_automatic_replies` | Guidance only — auto-replies aren't COM-settable (see below) |
-| `create_teams_meeting` | Send a meeting invite (Teams link via org setting, see below) |
-| `create_recurring_meeting` | Send a recurring meeting invite (daily/weekly/monthly/yearly) |
-| `list_meeting_invitations` | List pending meeting requests in your Inbox |
+
+**Meeting invitations, contacts & accounts**
+
+| Tool | Description |
+|------|-------------|
+| `list_meeting_invitations` | Meeting requests in your Inbox — response state + calendar conflicts |
 | `respond_to_invitation` | Accept / tentative / decline an invitation |
 | `list_shared_calendar` | Read another person's calendar (if shared to you) |
 | `list_contacts` | List/search the default Contacts folder |
+| `list_accounts` | List sending accounts and mail stores in the profile |
+| `outlook_health` | Diagnostics: Outlook version, user, store, connection mode |
 
-Emails are addressed by their Outlook `EntryID`, which `list_emails` and
-`search_emails` return — pass it to `get_email`, `reply_to_email`, etc.
-Folders accept well-known names (`Inbox`, `Sent Items`, `Drafts`, ...) or
-slash paths like `Inbox/Receipts` or `you@company.com/Inbox` to target a
-specific account.
+Emails and events are addressed by their Outlook `EntryID`, which the list/
+search tools return — pass it to `get_email`, `reply_to_email`,
+`update_calendar_event`, etc. Folders accept well-known names (`Inbox`,
+`Sent Items`, `Drafts`, ...) or slash paths like `Inbox/Receipts` or
+`you@company.com/Inbox` to target a specific account.
 
 ## Example prompts
 

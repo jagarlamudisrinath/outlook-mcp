@@ -171,3 +171,62 @@ def test_add_and_resolve_allow_unresolved():
         item, [("ghost@nowhere", "To", 1)], allow_unresolved=True
     )
     assert resolved[0]["resolved"] == "NO"
+
+
+# --- appointment rendering ------------------------------------------------
+
+
+def test_appointment_details_renders_key_fields():
+    appt = MagicMock()
+    appt.Subject = "Sprint Review"
+    appt.Organizer = "Alice"
+    appt.Start = datetime(2026, 7, 20, 10, 0)
+    appt.End = datetime(2026, 7, 20, 11, 0)
+    appt.AllDayEvent = False
+    appt.Location = "Room 1"
+    appt.Duration = 60
+    appt.IsRecurring = False
+    appt.ResponseStatus = 3  # Accepted
+    appt.Importance = 2
+    appt.Sensitivity = 0
+    appt.Categories = "Work"
+    appt.Body = "Agenda: https://teams.microsoft.com/l/meetup-join/xyz please join"
+    appt.EntryID = "ENTRY123"
+    appt.Attachments.Count = 0
+    # One required attendee who accepted.
+    recip = SimpleNamespace(
+        Type=1,
+        MeetingResponseStatus=3,
+        Name="Bob",
+        AddressEntry=SimpleNamespace(
+            Type="SMTP", Address="bob@corp.com", GetExchangeUser=lambda: None
+        ),
+        Address="bob@corp.com",
+    )
+    appt.Recipients = [recip]
+
+    out = s.appointment_details(appt)
+    assert "Subject: Sprint Review" in out
+    assert "Organizer: Alice" in out
+    assert "My response: Accepted" in out
+    assert "Importance: High" in out
+    assert "https://teams.microsoft.com/l/meetup-join/xyz" in out
+    assert "[Required] Bob <bob@corp.com> — Accepted" in out
+    assert "entry_id: ENTRY123" in out
+
+
+def test_meeting_attendees_maps_roles_and_status():
+    appt = MagicMock()
+    appt.Recipients = [
+        SimpleNamespace(
+            Type=2, MeetingResponseStatus=2, Name="Opt",
+            AddressEntry=SimpleNamespace(
+                Type="SMTP", Address="o@x.com", GetExchangeUser=lambda: None
+            ),
+            Address="o@x.com",
+        )
+    ]
+    people = s.meeting_attendees(appt)
+    assert people == [
+        {"role": "Optional", "name": "Opt", "smtp": "o@x.com", "response": "Tentative"}
+    ]
